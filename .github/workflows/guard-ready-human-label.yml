@@ -1,0 +1,372 @@
+name: Guard ready-human label
+
+# Pairs with `require-merge-label.yml` (which makes `ready-human` a required
+# merge gate). This workflow is the *companion* required check that fails
+# the merge if an unauthorized GitHub App bot added the label. Required
+# because events triggered by `secrets.GITHUB_TOKEN` do NOT re-trigger
+# workflow runs (only `workflow_dispatch` / `repository_dispatch` are exempt),
+# so `require-merge-label.yml` cannot self-correct after a label revoke.
+#
+# Every event reads the *current* label state from the GitHub API (not the
+# event payload) and looks up who added the label in the issue timeline.
+# Consequence: a failed label-revoke (e.g. API outage) doesn't wash out —
+# the label persists, the next event re-validates, the check stays red.
+#
+# Threat model: only GitHub App bots are policed. Two identity sources feed
+# the classification, in priority order:
+#   1. Labeled-event actor in the timeline (`actor.type == "Bot"`) — primary
+#      path when a `labeled` event exists in the timeline.
+#   2. PR author from /repos/.../pulls/N (`user.type == "Bot"`) — fallback
+#      when the label arrived with PR creation (no labeled event emitted).
+# Humans AND non-App bot-user collaborator accounts (login type "User") may
+# set the label freely — they are part of the human-review trust boundary
+# that `ready-human` certifies.
+# ACCEPTED RISK (see deadend#4947): a compromised PAT for a non-App machine
+# user would bypass this guard. Documented design choice; if you ever need
+# to deny specific machine users, add an explicit denylist where the
+# non-Bot fallthrough is granted.
+#
+# Label name `ready-human` is hardcoded in 4 coupled sites; if you ever
+# rename it, change all 4 IN ONE PR or the gate silently breaks:
+#   1. this file (the `label='...'` constant in the script)
+#   2. .github/workflows/require-merge-label.yml (`contains()` expression)
+#   3. GitHub Settings → Labels (the label itself)
+#   4. Branch protection required check names on `main`
+# See deadend#4948 for the coupling rationale.
+#
+# Branch protection setup (out-of-band): add BOTH required status checks
+# to `main` — `ready-human label authorization` (this workflow) AND
+# `ready-human label present` (from require-merge-label.yml). Missing
+# either one collapses the gate.
+#
+# Ported from elem6/deadend guard-ready-human-label.yml (the most hardened
+# iteration of this gate). Issue refs (deadend#4946/#4947/#4948) and OVHL
+# F-numbers in the comments point to that repo's tracker — kept for
+# traceability to the original hardening rationale.
+
+"on":                                  # quoted: yamllint truthy rule (repo convention)
+  # `pull_request_target` (not `pull_request`) is intentional: the workflow
+  # definition is read from the base branch, so a PR from a fork cannot ship
+  # a modified guard. It also runs with a token scoped to the base repo, which
+  # is what we need to call `gh pr edit --remove-label`.
+  #
+  # Trigger list covers every event that can change the (label, head-SHA)
+  # state so the required check is always re-published for the current head:
+  # `labeled`/`unlabeled` for label state, `synchronize` for new commits,
+  # `opened`/`reopened`/`ready_for_review` for lifecycle.
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, labeled, unlabeled, synchronize]
+
+# Dedupe rapid label toggles or push-then-label races on the same PR. Latest
+# event wins — older in-flight runs are cancelled, which is safe because the
+# new run will re-validate from API.
+concurrency:
+  group: guard-ready-human-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: write                 # remove the label + post the audit comment
+  issues: read                         # read /issues/{n}/timeline for labeler identity
+
+jobs:
+  authorize-ready-human:
+    name: ready-human label authorization
+    # Any registered self-hosted runner, x86 or ARM, any OS (no Actions
+    # minutes for GitHub-hosted in this org). The job is never gated by
+    # `if:` — a skipped (= passing) required check would satisfy the merge
+    # gate without the authorization actually running. The script needs
+    # `gh` and `jq` preinstalled on the runner. Running fork PRs on
+    # self-hosted is safe here: the job checks out no PR code and uses
+    # only framework-controlled context (repo name, numeric PR number,
+    # event action/sender) — no PR-controlled command-injection surface.
+    runs-on: self-hosted
+    steps:
+      - name: Validate ready-human label authorization
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          EVENT_ACTOR: ${{ github.event.sender.login }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+
+          # Local constants for the label and allowed-bot identities.
+          # See header comment for the 4 project-wide coupled sites.
+          label='ready-human'
+          allowed_bots=(ovhl-review)
+
+          # State flags surfaced via the EXIT trap so a post-mortem can tell
+          # which steps ran during the SIGTERM grace window when cancel-in-
+          # progress lands mid-step (deadend#4946 #6). Post-SIGKILL
+          # cancellations remain invisible — bash trap cannot fire after
+          # SIGKILL.
+          revoke_attempted=false
+          revoke_ok=false
+          comment_attempted=false
+          comment_ok=false
+          comment_suppressed=false
+
+          log_summary() {
+            # Always echo to stderr so the job log captures the audit even
+            # when GITHUB_STEP_SUMMARY is unset (local testing, custom
+            # runners, env-var rename). Otherwise the entire audit channel
+            # silently vanishes.
+            echo "[audit] $*" >&2
+            if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+              echo "$@" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "[audit] WARNING: failed to append to GITHUB_STEP_SUMMARY" >&2
+            fi
+          }
+          on_exit() {
+            log_summary "exit_state: revoke_attempted=$revoke_attempted revoke_ok=$revoke_ok comment_attempted=$comment_attempted comment_ok=$comment_ok comment_suppressed=$comment_suppressed"
+          }
+          trap on_exit EXIT
+
+          # Detective control (deadend#4946 #2): on every path, log who
+          # triggered THIS event. Closes the gap where an unauthorized bot
+          # labels at T0 and the label is removed by someone else at T1
+          # before our `gh pr view` call at T2 — without this, the bot
+          # attempt would be invisible in the workflow output.
+          log_summary "event: action=$EVENT_ACTION sender=$EVENT_ACTOR pr=$PR"
+
+          # Membership check used for both labeled-event actor AND
+          # PR-author fallback. Matches by login regardless of actor.type
+          # so the same bot identity passes whether reported as `Bot` (App
+          # installation token) or `User` (PAT-authenticated App) —
+          # deadend#4947 #2.
+          is_allowed_identity() {
+            local who="$1"
+            local bot
+            for bot in "${allowed_bots[@]}"; do
+              if [[ "$who" == "$bot" || "$who" == "${bot}[bot]" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          # Audit comment with 3-attempt exponential backoff (deadend#4946
+          # #3). Sleeps 1s/2s between retries; no trailing sleep after the
+          # final failed attempt. On total failure the body is logged via
+          # log_summary so an audit trail exists somewhere.
+          post_audit_comment() {
+            local body="$1"
+            local attempt
+            comment_attempted=true
+            for attempt in 1 2 3; do
+              if gh pr comment "$PR" --repo "$REPO" --body "$body"; then
+                comment_ok=true
+                return 0
+              fi
+              if [[ $attempt -lt 3 ]]; then
+                sleep $((2 ** (attempt - 1)))
+              fi
+            done
+            log_summary "audit comment failed after 3 attempts:"
+            log_summary "$body"
+            return 1
+          }
+
+          # Force-revoke helper used in BOTH the labeled-event bypass path
+          # and the author-fallback bypass path. Uses a per-call mktemp file
+          # for stderr capture: process substitution (`2> >(tee ...)`) is
+          # async, so a follow-up `cat` could read partial/stale buffers on
+          # recycled runners. The direct redirect is synchronous (OVHL F3).
+          force_revoke() {
+            revoke_attempted=true
+            local err_file err
+            err_file=$(mktemp)
+            if gh pr edit "$PR" --repo "$REPO" --remove-label "$label" 2> "$err_file"; then
+              revoke_ok=true
+            else
+              err=$(cat "$err_file")
+              cat "$err_file" >&2
+              echo "::error::Failed to remove label: ${err:-(no stderr captured)}"
+              log_summary "revoke failed: ${err:-(no stderr captured)}"
+            fi
+            rm -f "$err_file"
+          }
+
+          # Read current label state from API (ignore event payload).
+          if ! labels=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name'); then
+            echo "::error::Failed to fetch PR labels — likely transient outage. Re-run this check."
+            exit 1
+          fi
+          if ! grep -qx "$label" <<< "$labels"; then
+            echo "Pass: $label label is not on the PR (event=$EVENT_ACTION by $EVENT_ACTOR)"
+            log_summary "pass: label absent (event=$EVENT_ACTION sender=$EVENT_ACTOR)"
+            exit 0
+          fi
+
+          # Read the full timeline. `gh api --paginate` emits one JSON array
+          # per page; we MUST slurp + add — otherwise `... | last` would pick
+          # a per-page last and an unauthorized bot's event hidden on an
+          # earlier page would be silently missed.
+          #
+          # FAIL-CLOSED on any non-zero exit: a partial pagination (some
+          # pages succeeded, later page failed) leaves `timeline` truncated
+          # and the missing labeled event could be exactly the unauthorized
+          # one. Better to surface a transient outage and ask for re-run
+          # than to derive permission from an incomplete event set.
+          if ! timeline=$(gh api "repos/$REPO/issues/$PR/timeline" --paginate); then
+            echo "::error::Timeline API failed — fail-closed for merge gate. Re-run this check."
+            log_summary "timeline API non-zero exit — failing closed"
+            exit 1
+          fi
+          if [[ -z "$timeline" ]]; then
+            echo "::error::Timeline API returned empty response — likely transient outage. Re-run this check."
+            log_summary "timeline API empty response — failing closed"
+            exit 1
+          fi
+
+          # Distinguish jq parse errors from "no labeled event" via a sentinel
+          # marker (deadend#4946 #1). Blanket `catch null` would route
+          # schema-change errors into the author-fallback path and silently
+          # fail open.
+          added_by_event=$(jq -c --slurp --arg lbl "$label" '
+            try (add | [.[] | select(.event == "labeled" and .label.name == $lbl)] | last)
+            catch "PARSE_ERROR"
+          ' <<< "$timeline")
+
+          if [[ "$added_by_event" == '"PARSE_ERROR"' ]]; then
+            echo "::error::Timeline jq pipeline failed — possible API schema change. Failing closed."
+            log_summary "added_by_event jq parse error — failing closed"
+            exit 1
+          fi
+
+          if [[ "$added_by_event" == "null" || -z "$added_by_event" ]]; then
+            # No `labeled` event in timeline. Two scenarios:
+            #
+            # (A) Legitimate: PR created via API with `labels:[ready-human]`
+            #     in the create payload — the label arrived with creation,
+            #     not as a subsequent action, so no `labeled` event exists.
+            #     This is fine; check the PR author.
+            #
+            # (B) Bypass window: a `labeled` event JUST fired (and triggered
+            #     this workflow) but the timeline API hasn't propagated it
+            #     yet (eventual consistency). Without the action check, an
+            #     unauthorized bot could squeeze a non-bot author's PASS in
+            #     the propagation window (OVHL F1). For `labeled`/`unlabeled`
+            #     events, fail-closed with a re-run hint.
+            # ONLY `opened` is a true creation-time-label case — GitHub
+            # does not emit `labeled` events for labels that arrive in the
+            # PR-create payload. For `reopened`/`ready_for_review`/
+            # `synchronize`, the labeled event from the original labeling
+            # MUST already be in the timeline; missing it = either
+            # propagation lag (bypass window) or the original label was
+            # creation-time (already validated at `opened`). Either way,
+            # fail-closed: an unrelated bot could otherwise exploit
+            # `ready_for_review` — or time a push (`synchronize`) right
+            # after an unauthorized label — to bypass the labeled-event
+            # check (OVHL HIGH F1: draft PR → bot labels while timeline
+            # lags → mark ready → concurrency cancels labeled run →
+            # ready_for_review run sees no event + human author → PASS).
+            # KNOWN CONSEQUENCE (intentional): a PR API-created with the
+            # label in the create payload fails this check on its first
+            # push after creation — one-time manual remove+re-add of the
+            # label creates the timeline event and unblocks all later
+            # runs. Same tradeoff as reopen of a creation-time-labeled PR.
+            if [[ "$EVENT_ACTION" != "opened" ]]; then
+              echo "::error::No labeled event in timeline for event=$EVENT_ACTION — likely propagation lag. Re-apply label and re-run this check."
+              log_summary "no labeled event for event=$EVENT_ACTION — failing closed (only 'opened' allows author fallback)"
+              exit 1
+            fi
+            # Use raw REST API `.user.type` (stable contract) rather than
+            # gh-CLI `.is_bot` projection (deadend#4947 OVHL feedback).
+            if ! author_info=$(gh api "repos/$REPO/pulls/$PR" --jq '.user'); then
+              echo "::error::Failed to fetch PR author — fail-closed."
+              exit 1
+            fi
+            author=$(jq -r '.login' <<< "$author_info")
+            author_type=$(jq -r '.type // "Unknown"' <<< "$author_info")
+            if [[ "$author_type" == "Unknown" ]]; then
+              echo "::error::Cannot determine PR author type for $author — fail-closed."
+              log_summary "author type field missing for $author — failing closed"
+              exit 1
+            fi
+            if is_allowed_identity "$author"; then
+              echo "Pass: label present at PR creation by allowed identity $author"
+              log_summary "pass: PR-creation label by allowed identity $author"
+              exit 0
+            fi
+            if [[ "$author_type" != "Bot" ]]; then
+              echo "Pass: label present at PR creation by non-bot author $author (type=$author_type)"
+              log_summary "pass: PR-creation label by non-bot author $author (type=$author_type)"
+              exit 0
+            fi
+            # Author is an unauthorized Bot. Revoke + fail. Without the
+            # force_revoke call, the label would persist on the PR even
+            # after the check turns red — defeating the auto-cleanup intent
+            # of the guard.
+            echo "::error::$label is on PR but no labeled event found and author $author is a non-allowed bot"
+            force_revoke
+            exit 1
+          fi
+
+          added_by=$(jq -r '.actor.login' <<< "$added_by_event")
+          added_by_type=$(jq -r '.actor.type' <<< "$added_by_event")
+
+          # Allowlist check first — by login regardless of actor.type.
+          if is_allowed_identity "$added_by"; then
+            echo "Pass: label added by allowed identity $added_by"
+            log_summary "pass: labeled by allowed identity $added_by"
+            exit 0
+          fi
+
+          # Non-GitHub-App actors (humans + bot-user collaborators) are
+          # trusted per the threat model in the file header. See ACCEPTED
+          # RISK note for the PAT bypass caveat.
+          if [[ "$added_by_type" != "Bot" ]]; then
+            echo "Pass: label added by non-bot actor $added_by (type=$added_by_type)"
+            log_summary "pass: labeled by non-bot $added_by (type=$added_by_type)"
+            exit 0
+          fi
+
+          # Unauthorized GitHub App bot. Revoke + audit + fail.
+          echo "::error::Unauthorized actor '$added_by' added the $label label"
+
+          # Rate-limit duplicate audit comments (deadend#4946 #4). Filter
+          # for `unlabeled` events targeting THIS label by `github-actions`
+          # first (label-name filter prevents cross-contamination from other
+          # workflows that unlabel via the same token — OVHL F2), then take
+          # the last 20 — keeps the window meaningful when PR has heavy
+          # comment/commit traffic. Distinguish jq parse failure (sentinel
+          # -1 → fail-closed against spam by assuming loop) from "no recent
+          # revokes" (0 → comment posted).
+          recent_revokes=$(jq --slurp --arg lbl "$label" '
+            try (
+              add
+              | [.[] | select(.event == "unlabeled" and (.label.name // "") == $lbl and (.actor.login // "" | test("^github-actions(\\[bot\\])?$")))]
+              | .[-20:]
+              | length
+            )
+            catch -1
+          ' <<< "$timeline")
+
+          if [[ "$recent_revokes" -lt 0 ]]; then
+            echo "::warning::recent_revokes parse failed — assuming loop, suppressing comment"
+            log_summary "recent_revokes jq error — comment suppressed conservatively"
+            recent_revokes=999
+          fi
+
+          force_revoke
+
+          if [[ "$recent_revokes" -ge 2 ]]; then
+            comment_suppressed=true
+            echo "::warning::Rate-limiting audit comment — $recent_revokes prior auto-revokes detected"
+            log_summary "suppressed audit comment for bot $added_by (loop detected: $recent_revokes prior revokes)"
+          else
+            # Bilingual message (deadend#4946 #5) — EN first, CZ second.
+            # Built via printf so the blank-line separator doesn't break the
+            # YAML literal block (an unindented blank line inside `run: |`
+            # terminates the block at the YAML level).
+            en_msg="Label \`$label\` may only be added by an allowed bot (currently: \`${allowed_bots[*]}\`) or a human reviewer. Automatically removed — added by bot @${added_by}."
+            cz_msg="Label \`$label\` smí přidat pouze povolený bot (aktuálně: \`${allowed_bots[*]}\`) nebo lidský reviewer. Automaticky odstraněno — nastavil bot @${added_by}."
+            printf -v audit_body '%s\n\n%s' "$en_msg" "$cz_msg"
+            if ! post_audit_comment "$audit_body"; then
+              echo "::error::Audit comment failed after 3 attempts (see job summary for body)"
+            fi
+          fi
+
+          exit 1

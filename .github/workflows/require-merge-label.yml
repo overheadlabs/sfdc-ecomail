@@ -1,0 +1,52 @@
+name: Require merge label
+
+# Blocks merging unless the PR carries the `ready-human` label. Pairs with the
+# branch protection rule on `main`: this job runs on every PR event that can
+# change merge eligibility, and the protection rule promotes its conclusion
+# into a required status check. Forgetting (or removing) the label keeps the
+# PR red and un-mergeable until a human re-adds it after review.
+
+"on":                                # quoted: yamllint's truthy rule (matches
+                                     # repo workflow convention)
+  # `pull_request_target` (not `pull_request`) is intentional, mirroring
+  # guard-ready-human-label.yml: the workflow definition is read from the
+  # base branch, so a PR cannot rewrite this required check to
+  # unconditionally pass and merge itself without the label. Safe here:
+  # no PR code is checked out — the job only reads framework-controlled
+  # label context from the event payload.
+  pull_request_target:
+    # `synchronize` is included so the check re-runs against the latest commit
+    # SHA — required-status-check UX keys on (check_name, head SHA); without it
+    # a force-push after labeling stalls the merge with an "old" green check.
+    # `labeled` / `unlabeled` re-evaluate when the label is toggled.
+    # `ready_for_review` matters because branch protection only starts enforcing
+    # required checks once a PR leaves draft — without it, the last conclusion
+    # against the draft SHA can be stale and merge stays blocked.
+    types: [opened, reopened, ready_for_review, labeled, unlabeled, synchronize]
+
+# Dedupe rapid label toggles on the same PR. Without this, two runs (e.g.
+# `labeled` then `unlabeled` within seconds) race to publish a conclusion
+# against the same head SHA — required-status-check UX takes the latest
+# conclusion published, which can be the SLOWER run's stale verdict. The
+# cancel-in-progress flag aborts older in-flight runs so only the most
+# recent event's verdict ever lands on the check.
+concurrency:
+  group: require-merge-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read                     # least-privilege: no API writes needed
+
+jobs:
+  check-ready-human-label:
+    name: ready-human label present
+    # Any registered self-hosted runner, x86 or ARM, any OS (no Actions
+    # minutes for GitHub-hosted; an OS/arch label triple matched no runner
+    # and silently left this required check queued forever).
+    runs-on: self-hosted
+    steps:
+      - name: Fail if `ready-human` label is missing
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'ready-human') }}
+        run: |
+          echo "::error::PR is missing the \`ready-human\` label. A human reviewer must add it after review to unblock merge."
+          exit 1
