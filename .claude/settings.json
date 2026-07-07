@@ -1,0 +1,15 @@
+{
+  "extraKnownMarketplaces": {
+    "overheadlabs-marketplace": {
+      "source": { "source": "github", "repo": "overheadlabs/plugin-marketplaces" },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "ovhl-tools@overheadlabs-marketplace": true,
+    "pr-go@overheadlabs-marketplace": true,
+    "gh-bot-auth@overheadlabs-marketplace": true,
+    "skill-limit-guard@overheadlabs-marketplace": true,
+    "ultrathink@overheadlabs-marketplace": true
+  }
+}
