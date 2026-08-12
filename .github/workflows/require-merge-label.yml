@@ -40,10 +40,13 @@ permissions:
 jobs:
   check-ready-human-label:
     name: ready-human label present
-    # Any registered self-hosted runner, x86 or ARM, any OS (no Actions
-    # minutes for GitHub-hosted; an OS/arch label triple matched no runner
-    # and silently left this required check queued forever).
-    runs-on: self-hosted
+    # GitHub-hosted runner, pinned deliberately. This gate is a single label check
+    # that must publish a verdict within seconds; on the org's single self-hosted
+    # runner it queued behind long build jobs, and a required check that never
+    # reports blocks the merge just as hard as a failing one. Keep this in lockstep
+    # with guard-ready-human-label.yml — a gate whose halves run on different
+    # fleets fails in halves too.
+    runs-on: ubuntu-latest
     steps:
       - name: Fail if `ready-human` label is missing
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'ready-human') }}

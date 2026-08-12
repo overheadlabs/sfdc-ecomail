@@ -71,15 +71,16 @@ permissions:
 jobs:
   authorize-ready-human:
     name: ready-human label authorization
-    # Any registered self-hosted runner, x86 or ARM, any OS (no Actions
-    # minutes for GitHub-hosted in this org). The job is never gated by
-    # `if:` — a skipped (= passing) required check would satisfy the merge
-    # gate without the authorization actually running. The script needs
-    # `gh` and `jq` preinstalled on the runner. Running fork PRs on
-    # self-hosted is safe here: the job checks out no PR code and uses
-    # only framework-controlled context (repo name, numeric PR number,
-    # event action/sender) — no PR-controlled command-injection surface.
-    runs-on: self-hosted
+    # GitHub-hosted runner, pinned deliberately. This gate must publish a verdict
+    # within seconds; on the org's single self-hosted runner it queued behind long
+    # build jobs, and a required check that never reports blocks the merge just as
+    # hard as a failing one. `gh` and `jq` are both preinstalled on the
+    # GitHub-hosted image. The job is never gated by `if:` — a skipped (= passing)
+    # required check would satisfy the merge gate without the authorization
+    # actually running. Running fork PRs here is safe: the job checks out no PR
+    # code and uses only framework-controlled context (repo name, numeric PR
+    # number, event action/sender) — no PR-controlled command-injection surface.
+    runs-on: ubuntu-latest
     steps:
       - name: Validate ready-human label authorization
         env:
