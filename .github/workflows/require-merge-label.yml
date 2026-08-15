@@ -40,10 +40,17 @@ permissions:
 jobs:
   check-ready-human-label:
     name: ready-human label present
-    # Any registered self-hosted runner, x86 or ARM, any OS (no Actions
-    # minutes for GitHub-hosted; an OS/arch label triple matched no runner
-    # and silently left this required check queued forever).
-    runs-on: self-hosted
+    # GitHub-hosted, NOT self-hosted and NOT the `ghrunner-arc` scale set —
+    # this repo is the org's only public one, and the Default runner group
+    # (which holds both the classic runners and ARC) has
+    # `allows_public_repositories: false`. Any self-hosted target therefore
+    # matches no runner and leaves this required check queued until the 24h
+    # timeout kills it. That is not a misconfiguration to route around:
+    # GitHub recommends self-hosted runners only for private repos, because a
+    # fork can run its own code on them via a pull request.
+    # Costs nothing either way — GitHub-hosted standard runners are free for
+    # public repositories, so the org's ARC cost argument does not apply here.
+    runs-on: ubuntu-latest
     steps:
       - name: Fail if `ready-human` label is missing
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'ready-human') }}
