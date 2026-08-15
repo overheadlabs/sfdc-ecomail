@@ -71,15 +71,21 @@ permissions:
 jobs:
   authorize-ready-human:
     name: ready-human label authorization
-    # ARC scale set `ghrunner-arc` — the org's current fleet, replacing the
-    # label-matched legacy pool. Still no GitHub-hosted Actions minutes. The job
-    # is never gated by `if:` — a skipped (= passing) required check would satisfy
-    # the merge gate without the authorization actually running. The script needs
-    # `gh` and `jq`, both baked into the runner image. Running fork PRs on
-    # self-hosted is safe here: the job checks out no PR code and uses only
-    # framework-controlled context (repo name, numeric PR number, event
-    # action/sender) — no PR-controlled command-injection surface.
-    runs-on: ghrunner-arc
+    # GitHub-hosted, NOT the org's `ghrunner-arc` scale set — see the same note
+    # in require-merge-label.yml: this repo is public, and the runner group that
+    # holds every self-hosted runner (classic and ARC alike) sets
+    # `allows_public_repositories: false`, so a self-hosted target queues here
+    # forever instead of running. GitHub-hosted is free for public repos, and
+    # GitHub recommends keeping self-hosted runners off public repos anyway.
+    # The job is never gated by `if:` — a skipped (= passing) required check would
+    # satisfy the merge gate without the authorization actually running. The script
+    # needs `gh` and `jq`, both present on the GitHub-hosted Ubuntu image.
+    # Fork PRs are safe under `pull_request_target` here because the job checks
+    # out no PR code and reads only framework-controlled context (repo name,
+    # numeric PR number, event action/sender) — no PR-controlled command-injection
+    # surface. Keep it that way: adding an `actions/checkout` of the PR head would
+    # hand fork authors a write-scoped token.
+    runs-on: ubuntu-latest
     steps:
       - name: Validate ready-human label authorization
         env:
