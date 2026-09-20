@@ -89,7 +89,8 @@ jobs:
     steps:
       # Retry + backoff for every `gh` call in this job (transient network/5xx/429).
       # Inline copy of overheadlabs/.github/actions/gh-retry (its `gh` file,
-      # verbatim, at 76ed24aa8ce13334296f6ff1c7c05e16bd2469b4): this repo is
+      # verbatim, at 76ed24aa8ce13334296f6ff1c7c05e16bd2469b4 = tag
+      # gh-retry/v1.0.0): this repo is
       # public and a public repo cannot use a private org action. Resync by hand.
       - name: Install gh retry wrapper
         run: |
