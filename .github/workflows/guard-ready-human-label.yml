@@ -87,6 +87,88 @@ jobs:
     # hand fork authors a write-scoped token.
     runs-on: ubuntu-latest
     steps:
+      # Retry + backoff for every `gh` call in this job (transient network/5xx/429).
+      # Inline copy of overheadlabs/.github/actions/gh-retry (its `gh` file,
+      # verbatim, at 76ed24aa8ce13334296f6ff1c7c05e16bd2469b4 = tag
+      # gh-retry/v1.0.0): this repo is
+      # public and a public repo cannot use a private org action. Resync by hand.
+      - name: Install gh retry wrapper
+        run: |
+          bin="$RUNNER_TEMP/gh-retry/bin"
+          mkdir -p "$bin"
+          cat >"$bin/gh" <<'GH_RETRY_WRAPPER'
+          #!/usr/bin/env bash
+          # Obal kolem skutečného `gh`: opakuje volání, které selhalo na přechodné chybě
+          # (síť, 5xx, 429, secondary rate limit), s exponenciálním backoffem. Všechno
+          # ostatní — úspěch, 404, 422, chyba autorizace — vrací hned a beze změny.
+          #
+          # Instaluje ho install.sh jako `gh` na začátek PATH, takže workflow ani
+          # skripty se nemění: každé `gh ...` ve zbytku jobu jde přes tenhle soubor.
+          #
+          # Konfigurace přes env (nastavuje install.sh z inputů akce):
+          #   GH_RETRY_REAL         absolutní cesta ke skutečnému gh (povinné)
+          #   GH_RETRY_ATTEMPTS     počet pokusů celkem (default 4)
+          #   GH_RETRY_BASE_DELAY   první pauza v sekundách, pak se zdvojuje (default 2)
+          #   GH_RETRY_MAX_DELAY    strop jedné pauzy v sekundách (default 30)
+          #
+          # Známé kompromisy:
+          #   - stdout se drží v bufferu, dokud pokus neskončí — jinak by retry
+          #     vypsal částečný výstup dvakrát. `--watch` a `gh run watch` proto jdou
+          #     rovnou na skutečné gh, bez retry.
+          #   - Zápis, který dostal 5xx, mohl na serveru projít. Label/PATCH/DELETE jsou
+          #     idempotentní; nový komentář se ve vzácném případě může zdvojit. Radši
+          #     dvojí komentář než rudý gate kvůli jednomu ztracenému paketu.
+          set -uo pipefail
+
+          real=${GH_RETRY_REAL:?gh-retry: GH_RETRY_REAL není nastavené}
+          attempts=${GH_RETRY_ATTEMPTS:-4}
+          delay=${GH_RETRY_BASE_DELAY:-2}
+          max_delay=${GH_RETRY_MAX_DELAY:-30}
+
+          # Sledovací příkazy streamují výstup po dobu minut; buffer by je rozbil.
+          case " $* " in
+            *" --watch "* | " run watch "*) exec "$real" "$@" ;;
+          esac
+
+          # Přechodné chyby, jak je gh vypisuje na stderr. Primární rate limit
+          # ("API rate limit exceeded") tu záměrně není — ten se za 30 s neobnoví.
+          transient='i/o timeout|connection reset|connection refused|broken pipe|TLS handshake timeout|unexpected EOF|: EOF$|no such host|server misbehaving|timeout awaiting response headers|Client\.Timeout exceeded|context deadline exceeded|GOAWAY|stream error|HTTP 5[0-9][0-9]|\(HTTP 5[0-9][0-9]\)|HTTP 429|secondary rate limit|was submitted too quickly|Something went wrong while executing your query'
+
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+
+          # Stdin čteme jen když si ho volání výslovně žádá (`--input -`,
+          # `--body-file -`, `-F body=@-`): jen tak ho jde poslat znovu. Jinak zůstává
+          # nedotčený — čtení stdinu, který nikdo nezavřel, by se zaseklo.
+          stdin=
+          for arg in "$@"; do
+            case "$arg" in
+              - | *@-) stdin="$tmp/stdin"; cat >"$stdin"; break ;;
+            esac
+          done
+
+          for ((attempt = 1; ; attempt++)); do
+            if [ -n "$stdin" ]; then
+              "$real" "$@" <"$stdin" >"$tmp/out" 2>"$tmp/err"
+            else
+              "$real" "$@" >"$tmp/out" 2>"$tmp/err"
+            fi
+            rc=$?
+            if [ "$rc" -eq 0 ] || [ "$attempt" -ge "$attempts" ] || ! grep -qE "$transient" "$tmp/err"; then
+              cat "$tmp/out"
+              cat "$tmp/err" >&2
+              exit "$rc"
+            fi
+            # Jitter do jedné sekundy, ať se souběžné joby po výpadku nesynchronizují.
+            pause="$delay.$((RANDOM % 10))"
+            echo "gh-retry: pokus $attempt/$attempts selhal (rc=$rc), znovu za ${pause}s: $(tail -n 1 "$tmp/err")" >&2
+            sleep "$pause"
+            delay=$((delay * 2 > max_delay ? max_delay : delay * 2))
+          done
+          GH_RETRY_WRAPPER
+          chmod 0755 "$bin/gh"
+          echo "GH_RETRY_REAL=$(command -v gh)" >>"$GITHUB_ENV"
+          echo "$bin" >>"$GITHUB_PATH"
       - name: Validate ready-human label authorization
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
