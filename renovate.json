@@ -1,0 +1,9 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Supply-chain politika (7denní cooldown, SHA-piny actions, žádný automerge)",
+    "žije v org presetu `overheadlabs/.github:renovate-config`. Tady ji smíš",
+    "jen doplnit, nikdy přebít — README v overheadlabs/.github."
+  ],
+  "extends": ["local>overheadlabs/.github:renovate-config"]
+}
