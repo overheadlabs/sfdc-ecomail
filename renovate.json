@@ -1,8 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Inline kopie org presetu `overheadlabs/.github:renovate-config` (7denní cooldown, SHA-piny actions, žádný automerge, PR jen po schválení v Dependency Dashboard).",
-    "Tohle repo je veřejné a privátní `overheadlabs/.github` z něj Renovate nepřečte (`Cannot find preset's package`, #9) — proto `extends` na preset nejde. Při změně presetu změň i tohle a nikdy jeho supply-chain klíče nezmírňuj."
+    "Doslovná kopie org presetu `overheadlabs/.github:renovate-config` (mimo `description`) — zdůvodnění klíčů viz tam.",
+    "Tohle repo je veřejné a privátní `overheadlabs/.github` z něj Renovate nepřečte (`Cannot find preset's package`, #9) — proto `extends` na preset nejde. Při změně presetu změň i tohle a nikdy jeho supply-chain klíče nezmírňuj.",
+    "Pozor: z `enabledManagers` tu dnes nic nenajde (žádné `uses:`, bun/pep621/mise soubory) a `npm` zapnutý není, takže devDependencies v `package.json` Renovate neaktualizuje."
   ],
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "enabledManagers": ["github-actions", "bun", "pep621", "mise"],
