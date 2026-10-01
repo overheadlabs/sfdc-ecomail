@@ -1,9 +1,37 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Supply-chain politika (7denní cooldown, SHA-piny actions, žádný automerge)",
-    "žije v org presetu `overheadlabs/.github:renovate-config`. Tady ji smíš",
-    "jen doplnit, nikdy přebít — README v overheadlabs/.github."
+    "Doslovná kopie org presetu `overheadlabs/.github:renovate-config` (mimo `description`) — zdůvodnění klíčů viz tam.",
+    "Tohle repo je veřejné a privátní `overheadlabs/.github` z něj Renovate nepřečte (`Cannot find preset's package`, #9) — proto `extends` na preset nejde. Při změně presetu změň i tohle a nikdy jeho supply-chain klíče nezmírňuj.",
+    "Pozor: z `enabledManagers` tu dnes nic nenajde (žádné `uses:`, bun/pep621/mise soubory) a `npm` zapnutý není, takže devDependencies v `package.json` Renovate neaktualizuje."
   ],
-  "extends": ["local>overheadlabs/.github:renovate-config"]
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "enabledManagers": ["github-actions", "bun", "pep621", "mise"],
+
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "prCreation": "not-pending",
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": "7 days",
+    "prCreation": "not-pending",
+    "dependencyDashboardApproval": true
+  },
+  "pinDigests": true,
+
+  "dependencyDashboard": true,
+  "dependencyDashboardApproval": true,
+  "prConcurrentLimit": 2,
+  "prHourlyLimit": 1,
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["/^overheadlabs\\//"],
+      "enabled": false
+    }
+  ]
 }
